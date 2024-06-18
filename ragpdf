@@ -1,0 +1,255 @@
+from flask import Flask, render_template, request, session, render_template_string
+from flask_socketio import SocketIO, emit
+from flask_session import Session
+import pandas as pd
+import matplotlib.pyplot as plt
+import io
+import base64
+import os
+from openai import OpenAI
+
+app = Flask(__name__)
+app.secret_key = os.urandom(24)
+socketio = SocketIO(app, async_mode='threading')
+
+# Configure server-side session storage
+app.config['SESSION_TYPE'] = 'filesystem'
+Session(app)
+
+clients = {
+    "Qwen - 2": OpenAI(base_url="", api_key="not-needed")
+}
+
+openai_model = "gpt-4"
+
+names_filtered_corrected = [
+    'Anh', 'Vy', 'Ngọc', 'Nhi', 'Hân', 'Thư', 'Linh', 'Như', 'Ngân', 'Phương',
+    'Thảo', 'My', 'Trân', 'Quỳnh', 'Nghi', 'Trang', 'Trâm', 'An', 'Thy', 'Châu',
+    'Trúc', 'Uyên', 'Yến', 'Ý', 'Tiên', 'Mai', 'Hà', 'Vân', 'Nguyên', 'Hương',
+    'Quyên', 'Duyên', 'Kim', 'Trinh', 'Thanh', 'Tuyền', 'Hằng', 'Dương', 'Chi',
+    'Giang', 'Tâm', 'Lam', 'Tú', 'Ánh', 'Hiền', 'Khánh', 'Huyền', 'Thùy',
+    'Vi', 'Ly', 'Dung', 'Nhung', 'Phúc', 'Lan', 'Phụng', 'Ân', 'Thi', 'Khanh',
+    'Kỳ', 'Nga', 'Tường', 'Thúy', 'Mỹ', 'Hoa', 'Tuyết', 'Lâm', 'Thủy', 'Đan',
+    'Hạnh', 'Xuân', 'Oanh', 'Mẫn', 'Khuê', 'Diệp', 'Thương', 'Nhiên', 'Băng',
+    'Hồng', 'Bình', 'Loan', 'Thơ', 'Phượng', 'Mi', 'Nhã', 'Nguyệt', 'Bích', 'Đào',
+    'Diễm', 'Kiều', 'Di', 'Liên', 'Trà', 'Tuệ', 'Thắm', 'Diệu'
+]
+
+upload_form_template = '''
+<div class="form-container">
+    <form id="uploadForm" method="POST" enctype="multipart/form-data" class="horizontal-form">
+        <input type="radio" id="segmentation" name="preset_data" value="segmentation">
+        <label for="segmentation">FMCG</label><br>
+        <input type="radio" id="realestate" name="preset_data" value="realestate">
+        <label for="realestate">BĐS</label><br>
+        <button type="submit" name="action" value="display_preset">Hiển thị</button><br>
+        <input type="file" name="file">
+        <button type="submit" name="action" value="upload_file">Upload File</button>
+    </form>
+</div>
+'''
+
+analysis_options_template = '''
+<div class="form-container">
+    <p>Dạ {{ greeting }} {{ username }}, anh/chị muốn biết gì về tập dữ liệu này?</p>
+    <form id="analysis-options-form" method="POST" action="/" class="horizontal-form">
+        <input type="radio" id="overview" name="analysis_option" value="overview">
+        <label for="overview">Phân tích tổng quan</label>
+        <input type="radio" id="second_column" name="analysis_option" value="second_column">
+        <label for="second_column">Phân tích cột {{ second_column }}</label>
+        <input type="radio" id="third_column" name="analysis_option" value="third_column">
+        <label for="third_column">Phân tích cột {{ third_column }}</label>
+        <button type="submit">Hiển thị</button>
+    </form>
+</div>
+'''
+
+selected_data = None
+
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    global selected_data
+    if 'messages' not in session:
+        session['messages'] = [
+            {"role": "assistant", "content": "Dạ em là Metricity, chào Anh/Chị, cho em xin tên của mình để tiện xưng hô và hỗ trợ ạ!"}
+        ]
+    user_messages = session['messages']
+
+    username = session.get('username', None)
+    greeting = "Anh"
+
+    if username:
+        if any(name in username for name in names_filtered_corrected):
+            greeting = "Chị"
+
+    if request.method == 'POST':
+        print("Form Submitted")
+        print(request.form)
+        action = request.form.get('action')
+
+        if 'name' in request.form:
+            username = request.form['name']
+            session['username'] = username
+            user_messages.append({"role": "user", "content": username})
+
+            if any(name in username for name in names_filtered_corrected):
+                greeting = "Chị"
+            else:
+                greeting = "Anh"
+
+            user_messages.append({
+                "role": "assistant",
+                "content": f"Dạ chào {greeting} {username}. Mình có thể đưa dữ liệu vào hệ thống để em phân tích hoặc sử dụng các tập dữ liệu có sẵn"
+            })
+            user_messages.append({
+                "role": "assistant",
+                "content": render_template_string(upload_form_template)
+            })
+            emit_update_messages(user_messages)
+            session['messages'] = user_messages
+            return render_template('index.html', messages=user_messages, username=username)
+
+        if action == 'upload_file' and 'file' in request.files:
+            file = request.files['file']
+            if file:
+                file_data = pd.read_csv(file, sep=',')
+                selected_data = file_data.iloc[:4, :4]
+                table_html = selected_data.to_html(classes='dataframe table table-striped', header="true", index=False)
+                user_messages.append({"role": "assistant", "content": f"Dạ dữ liệu đã được tải lên:<div class='table-container'>{table_html}</div>"})
+                selected_data = file_data
+                user_messages.append({
+                    "role": "assistant",
+                    "content": render_template_string(analysis_options_template, greeting=greeting, username=username,
+                                                      second_column=selected_data.columns[1],
+                                                      third_column=selected_data.columns[2])
+                })
+                emit_update_messages(user_messages)
+                session['messages'] = user_messages
+            return render_template('index.html', messages=user_messages, username=username)
+
+        if action == 'display_preset' and 'preset_data' in request.form:
+            preset_data = request.form['preset_data']
+            if preset_data == 'segmentation':
+                file_path = '/Users/vutong/Downloads/data/segmentationdata.csv'
+            elif preset_data == 'realestate':
+                file_path = '/Users/vutong/Downloads/data/Realestate.csv'
+            else:
+                file_path = None
+
+            if file_path:
+                file_data = pd.read_csv(file_path, sep=',')
+                selected_data = file_data.iloc[:4, :4]
+                table_html = selected_data.to_html(classes='dataframe table table-striped', header="true", index=False)
+                user_messages.append({"role": "assistant", "content": f"Dạ dữ liệu đã được tải lên:<div class='table-container'>{table_html}</div>"})
+
+                user_messages.append({
+                    "role": "assistant",
+                    "content": render_template_string(analysis_options_template, greeting=greeting, username=username,
+                                                      second_column=selected_data.columns[1],
+                                                      third_column=selected_data.columns[2])
+                })
+                emit_update_messages(user_messages)
+                session['messages'] = user_messages
+            return render_template('index.html', messages=user_messages, username=username)
+
+        if 'analysis_option' in request.form:
+            analysis_option = request.form['analysis_option']
+            print(f"Selected analysis option: {analysis_option}")
+            analysis_text = ""
+            chart_html = ""
+            if selected_data is not None:
+                if analysis_option == 'overview':
+                    analysis_text = f"Phân tích tổng quan:\n{selected_data.describe(include='all').to_string()}"
+                    numerical_columns = selected_data.select_dtypes(include=['number', 'datetime']).columns
+                    if not numerical_columns.empty:
+                        fig, ax = plt.subplots()
+                        selected_data[numerical_columns].hist(ax=ax)
+                        buf = io.BytesIO()
+                        plt.savefig(buf, format='png', bbox_inches='tight')
+                        buf.seek(0)
+                        chart_data = base64.b64encode(buf.getvalue()).decode('utf8')
+                        chart_html = f"<img src='data:image/png;base64,{chart_data}' class='responsive-chart'/>"
+                        plt.close(fig)
+                    else:
+                        chart_html = "<p>No numerical or datetime columns available for histogram plotting.</p>"
+                elif analysis_option == 'second_column':
+                    column_name = selected_data.columns[1]
+                    analysis_text = f"{column_name}:\n{selected_data[column_name].describe(include='all').to_string()}"
+                    if pd.api.types.is_numeric_dtype(selected_data[column_name]) or pd.api.types.is_datetime64_any_dtype(selected_data[column_name]):
+                        fig, ax = plt.subplots()
+                        selected_data[column_name].hist(ax=ax)
+                        buf = io.BytesIO()
+                        plt.savefig(buf, format='png', bbox_inches='tight')
+                        buf.seek(0)
+                        chart_data = base64.b64encode(buf.getvalue()).decode('utf8')
+                        chart_html = f"<img src='data:image/png;base64,{chart_data}' class='responsive-chart'/>"
+                        plt.close(fig)
+                    else:
+                        chart_html = "<p>Selected column is not numerical or datetime, cannot plot histogram.</p>"
+                elif analysis_option == 'third_column':
+                    column_name = selected_data.columns[2]
+                    analysis_text = f"{column_name}:\n{selected_data[column_name].describe(include='all').to_string()}"
+                    if pd.api.types.is_numeric_dtype(selected_data[column_name]) or pd.api.types.is_datetime64_any_dtype(selected_data[column_name]):
+                        fig, ax = plt.subplots()
+                        selected_data[column_name].hist(ax=ax)
+                        buf = io.BytesIO()
+                        plt.savefig(buf, format='png', bbox_inches='tight')
+                        buf.seek(0)
+                        chart_data = base64.b64encode(buf.getvalue()).decode('utf8')
+                        chart_html = f"<img src='data:image/png;base64,{chart_data}' class='responsive-chart'/>"
+                        plt.close(fig)
+                    else:
+                        chart_html = "<p>Selected column is not numerical or datetime, cannot plot histogram.</p>"
+
+                client = clients["Qwen - 2"]
+                user_messages.append({"role": "user", "content": analysis_text})
+
+                response = client.chat.completions.create(
+                    model=openai_model,
+                    messages=user_messages
+                )
+                assistant_message = response.choices[0].message.content
+                user_messages.append({"role": "assistant", "content": assistant_message})
+
+                user_messages.append({"role": "assistant", "content": f"<div class='chart-container'>{chart_html}</div>"})
+                session['chart_html'] = chart_html  # Store chart HTML in the session
+                emit_update_messages(user_messages)
+                session['messages'] = user_messages
+            return render_template('index.html', messages=user_messages, username=username)
+
+        if 'message' in request.form:
+            user_message = request.form['message']
+            user_messages.append({"role": "user", "content": user_message})
+
+            if selected_data is not None:
+                data_description = selected_data.describe().to_string()
+                data_message = f"Dữ liệu hiện tại:\n{data_description}\n\n{user_message}"
+            else:
+                data_message = user_message
+
+            client = clients["Qwen - 2"]
+            response = client.chat.completions.create(
+                model=openai_model,
+                messages=user_messages + [{"role": "user", "content": data_message}]
+            )
+            assistant_message = response.choices[0].message.content
+            user_messages.append({"role": "assistant", "content": assistant_message})
+
+            emit_update_messages(user_messages)
+            session['messages'] = user_messages
+            return render_template('index.html', messages=user_messages, username=username)
+
+    session['messages'] = user_messages
+    chart_html = session.get('chart_html', '')  # Retrieve chart HTML from the session
+    return render_template('index.html', messages=user_messages, username=username, chart_html=chart_html)
+
+def emit_update_messages(messages):
+    socketio.emit('update_messages', {'messages': messages})
+
+@socketio.on('connect')
+def handle_connect():
+    if 'messages' in session:
+        emit('update_messages', {'messages': session['messages']})
+
+if __name__ == '__main__':
+    socketio.run(app, debug=True)
