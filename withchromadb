@@ -1,0 +1,284 @@
+import streamlit as st
+import openai
+import plotly.express as px
+from torch import cuda
+from langchain.document_loaders import WebBaseLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import FAISS
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.chains import ConversationalRetrievalChain
+from langchain import OpenAI
+import pandas as pd
+import csv
+import json
+
+openai.api_key = st.secrets["openai_key"]
+
+# Determine device
+device = f'cuda:{cuda.current_device()}' if cuda.is_available() else 'cpu'
+
+# Initialize embedding function and model
+embedding_function = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+llm = OpenAI(base_url="https://direct-piranha-hideously.ngrok-free.app/v1/", api_key="not-needed")
+
+# Initialize Chroma vectorstore
+chroma_db_directory = "./chroma_db_nccn"
+vector_db = Chroma(persist_directory=chroma_db_directory, embedding_function=embedding_function)
+
+
+@st.cache_data
+def load_data(file):
+    """Load data with caching to improve performance."""
+    file_type = file.name.split('.')[-1]
+    if file_type == "csv" or file_type == "txt":
+        # Use csv.Sniffer to detect delimiter
+        sample = file.read(1024).decode()
+        file.seek(0)
+        sniffer = csv.Sniffer()
+        try:
+            delimiter = sniffer.sniff(sample).delimiter
+        except csv.Error:
+            delimiter = ','  # Default to comma if detection fails
+        return pd.read_csv(file, delimiter=delimiter)
+    elif file_type in ["xls", "xlsx"]:
+        return pd.read_excel(file)
+    else:
+        raise ValueError("Unsupported file type")
+
+
+def handle_online_search(prompt):
+    """Handle online search and retrieve information."""
+    web_links = [f"https://www.google.com/search?q={prompt.replace(' ', '+')}"]
+    loader = WebBaseLoader(web_links)
+    documents = loader.load()
+
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=20)
+    all_splits = text_splitter.split_documents(documents)
+
+    vectorstore = FAISS.from_documents(all_splits, embedding_function)
+    chain = ConversationalRetrievalChain.from_llm(llm=llm, retriever=vectorstore.as_retriever(),
+                                                  return_source_documents=True)
+
+    chat_history = []
+
+    result = chain({"question": prompt, "chat_history": chat_history})
+
+    return result['answer']
+
+
+def handle_data_analysis(prompt, data):
+    """Handle data analysis by sending data to the model."""
+    text_data = data.to_string()
+    full_prompt = f"{prompt}\n\nData:\n{text_data}"
+    result = llm(full_prompt)
+
+
+    # Check if result is a string and try to parse it as JSON
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except json.JSONDecodeError:
+            # If JSON parsing fails, return the raw string
+            return result
+
+    if 'text' in result:
+        return result['text']
+    else:
+        return "No 'text' key found in the result"
+
+
+def handle_offline_interaction(prompt):
+    """Handle offline interaction with ChromaDB and model"""
+    search_results = vector_db.similarity_search(prompt, k=2)
+    some_context = ""
+    for result in search_results:
+        some_context += result.page_content + "\n\n"
+    full_prompt = f"{some_context}\n\n{prompt}"
+    result = llm(full_prompt)
+
+
+    # Check if result is a string and try to parse it as JSON
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except json.JSONDecodeError:
+            # If JSON parsing fails, return the raw string
+            return result
+
+    if 'text' in result:
+        return result['text']
+    else:
+        return "No 'text' key found in the result"
+
+
+# Split long results into smaller chunks for display
+def display_long_text(text):
+    max_length = 1000  # Define the maximum length of each chunk
+    for i in range(0, len(text), max_length):
+        st.write(text[i:i+max_length])
+
+
+# Plotting functions for different types of analysis
+def plot_overview(data, plot_types):
+    numeric_data = data.select_dtypes(include=['number'])
+    categorical_data = data.select_dtypes(include=['object', 'category'])
+
+    if numeric_data.empty and categorical_data.empty:
+        st.error("No data available for plotting.")
+        return
+
+    if not numeric_data.empty:
+        if "Histogram" in plot_types:
+            fig = px.histogram(numeric_data)
+            st.plotly_chart(fig)
+        if "Scatter" in plot_types and len(numeric_data.columns) > 1:
+            fig = px.scatter(numeric_data, x=numeric_data.columns[0], y=numeric_data.columns[1])
+            st.plotly_chart(fig)
+        if "Box" in plot_types:
+            fig = px.box(numeric_data)
+            st.plotly_chart(fig)
+        if "Line" in plot_types and len(numeric_data.columns) > 1:
+            fig = px.line(numeric_data, x=numeric_data.columns[0], y=numeric_data.columns[1])
+            st.plotly_chart(fig)
+
+    if not categorical_data.empty:
+        if "Bar" in plot_types:
+            fig = px.bar(categorical_data)
+            st.plotly_chart(fig)
+        if "Pie" in plot_types:
+            for col in categorical_data.columns:
+                fig = px.pie(categorical_data, names=col)
+                st.plotly_chart(fig)
+
+
+def plot_column_analysis(data, column, plot_types):
+    if data[column].dtype in ['int64', 'float64']:
+        if "Histogram" in plot_types:
+            fig = px.histogram(data, x=column)
+            st.plotly_chart(fig)
+        if "Scatter" in plot_types and len(data.columns) > 1:
+            fig = px.scatter(data, x=column, y=data.columns[1])
+            st.plotly_chart(fig)
+        if "Box" in plot_types:
+            fig = px.box(data, x=column)
+            st.plotly_chart(fig)
+        if "Line" in plot_types and len(data.columns) > 1:
+            fig = px.line(data, x=column, y=data.columns[1])
+            st.plotly_chart(fig)
+    elif data[column].dtype in ['object', 'category']:
+        if "Bar" in plot_types:
+            fig = px.bar(data, x=column)
+            st.plotly_chart(fig)
+        if "Pie" in plot_types:
+            fig = px.pie(data, names=column)
+            st.plotly_chart(fig)
+    else:
+        st.error(f"Column '{column}' has an unsupported data type for plotting.")
+
+
+# Main function
+st.header("METRICITY")
+
+if "messages" not in st.session_state:
+    st.session_state.messages = [{"role": "assistant", "content": "Xin chào bạn, bạn đến từ công ty nào?"}]
+    st.session_state.search_mode = False  # Initialize search mode
+    st.session_state.show_sample_data = False  # Initialize show sample data
+
+# Render chat history
+for message in st.session_state.messages:
+    if isinstance(message, dict) and "role" in message:
+        with st.chat_message(message["role"]):
+            st.write(message.get("content", "No content"))
+    else:
+        st.error("Invalid message format.")
+
+prompt = st.chat_input("Your question")
+if prompt:
+    st.session_state.messages.append({"role": "user", "content": prompt})
+
+    if st.session_state.messages[-2]["role"] == "assistant" and \
+            st.session_state.messages[-2]["content"].startswith("Xin chào bạn"):
+        st.session_state.company = prompt
+        st.session_state.search_mode = True  # Switch to online mode automatically
+        result = handle_online_search(prompt)
+        st.session_state.search_mode = False  # Switch back to offline mode
+    elif st.session_state.search_mode:
+        result = handle_online_search(prompt)
+    else:
+        result = handle_offline_interaction(prompt)
+
+    st.session_state.messages.append({"role": "assistant", "content": result})
+
+# Ensure data and analysis move to the top after first interaction
+if len(st.session_state.messages) > 2:
+    # Handles file upload and data interactions only in offline mode
+    uploaded_file = st.file_uploader("Upload CSV, Excel, or TXT file", type=["csv", "xlsx", "txt"])
+    if uploaded_file is not None:
+        try:
+            st.session_state.selected_data = load_data(uploaded_file)
+            st.session_state.show_sample_data = True
+            st.session_state.messages.append({"role": "assistant", "content": "Dữ liệu đã được tải lên thành công!"})
+        except ValueError as e:
+            st.error(f"Error: {e}")
+
+    preset_data = st.radio("Chọn dữ liệu mẫu", ("FMCG", "BĐS"), key="preset_data")
+    if st.button("Hiển thị dữ liệu mẫu"):
+        preset_data = st.session_state.preset_data
+        file_path = None
+        if preset_data == 'FMCG':
+            file_path = '/Users/vutong/Downloads/data/segmentationdata.csv'
+        elif preset_data == 'BĐS':
+            file_path = '/Users/vutong/Downloads/data/Realestate.csv'
+        if file_path:
+            st.session_state.selected_data = load_data(file_path)
+            st.session_state.show_sample_data = True
+            st.session_state.messages.append({"role": "assistant", "content": "Dữ liệu mẫu đã được hiển thị!"})
+
+    if "selected_data" in st.session_state and st.session_state.selected_data is not None and not st.session_state.selected_data.empty:
+        if "show_sample_data" in st.session_state and st.session_state.show_sample_data:
+            st.dataframe(st.session_state.selected_data)
+
+        # Analyze and plot data based on user selection
+        analysis_options = ["Phân tích tổng quan"]
+        for col in st.session_state.selected_data.columns:
+            analysis_options.append(f"Phân tích cột {col}")
+
+        # Display radio buttons horizontally
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            st.write("Chọn cột:")
+        with col2:
+            selected_columns = st.radio("", analysis_options, horizontal=True, key="selected_column")
+
+        plot_types = st.multiselect(
+            "Chọn loại biểu đồ bạn muốn vẽ:",
+            ["Histogram", "Scatter", "Box", "Line", "Bar", "Pie"],
+            default=["Histogram"]
+        )
+
+        if st.button("Gửi yêu cầu phân tích"):
+            if selected_columns == "Phân tích tổng quan":
+                prompt = "Phân tích tổng quan, diễn giải thành một đoạn văn dưới góc nhìn giả sử bạn là một chuyên gia trong lĩnh vực Data Analyst & Business Development"
+                plot_overview(st.session_state.selected_data, plot_types)
+            else:
+                column_name = selected_columns.split("cột ")[1]
+                prompt = f"Phân tích cột {column_name} diễn giải thành đoạn văn, dưới góc nhìn giả sử bạn là một chuyên gia trong lĩnh vực Data Analyst & Business Development "
+                plot_column_analysis(st.session_state.selected_data, column_name, plot_types)
+
+            try:
+                result = handle_data_analysis(prompt, st.session_state.selected_data)
+                st.session_state.messages.append({"role": "assistant", "content": result})
+                display_long_text(result)  # Use the new function to display long text
+            except (TypeError, KeyError) as e:
+                st.error(f"Error: {e}")
+
+# Online mode toggle checkbox in the sidebar
+st.sidebar.markdown("---")
+if st.sidebar.checkbox("Search Online"):
+    st.session_state.search_mode = True  # Enable online mode manually
+else:
+    st.session_state.search_mode = False  # Disable online mode manually
+
+if "selected_data" not in st.session_state or st.session_state.selected_data is None:
+    st.write("No data selected or data is empty.")
